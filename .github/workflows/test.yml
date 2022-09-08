@@ -61,5 +61,5 @@ jobs:
       - name: Test
         run: go test -v .
 
-      - name: Show Data
-        run: ./snmp-prom-exporter --version
+#      - name: Show Data
+#        run: ./snmp-prom-exporter --version
