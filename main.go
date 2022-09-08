@@ -13,10 +13,13 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
+	g "github.com/gosnmp/gosnmp"
 	"gopkg.in/yaml.v2"
 	"io"
 	"io/ioutil"
-	"log"
+	stdlog "log"
 	"net"
 	"net/http"
 	"os"
@@ -26,51 +29,55 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	g "github.com/gosnmp/gosnmp"
 )
 
-var version = "0.1.1"
-var Reset = "\033[0m"
-var Red = "\033[31m"
-var Green = "\033[32m"
-var Yellow = "\033[33m"
-var Blue = "\033[34m"
-var Purple = "\033[35m"
-var Cyan = "\033[36m"
-var Gray = "\033[37m"
-var White = "\033[97m"
+var (
+	version = "0.1.1"
+	Reset   = "\033[0m"
+	Red     = "\033[31m"
+	Green   = "\033[32m"
+	Yellow  = "\033[33m"
+	Blue    = "\033[34m"
+	Purple  = "\033[35m"
+	Cyan    = "\033[36m"
+	Gray    = "\033[37m"
+	White   = "\033[97m"
+	logger  log.Logger // logger
+)
 
 type Config struct {
-	Push     string `yaml:"push"`
-	Interval string `yaml:"interval"`
-	Devices  []struct {
-		Name         string             `yaml:"name"`
-		Host         string             `yaml:"host"`
-		Port         uint16             `yaml:"port"`
-		Protocol     string             `yaml:"protocol"`
-		Community    string             `yaml:"community"`
-		UserName     string             `yaml:"username"`
-		AuthProto    string             `yaml:"auth-protocol"`
-		AuthPassword string             `yaml:"auth-password"`
-		PrivProto    string             `yaml:"priv-protocol"`
-		PrivPassword string             `yaml:"priv-password"`
-		Version      string             `yaml:"version"`
-		Interval     string             `yaml:"interval"`
-		Enabled      bool               `yaml:"enabled" default:true`
-		CopyFrom     string             `yaml:"copy-oids-from"`
-		Labels       map[string]string  `yaml:"labels"`
-		Status       map[string]string  `yaml:"status"`
-		StaticLabels map[string]string  `yaml:"static-labels"`
-		StaticStatus map[string]float64 `yaml:"static-status"`
-		Groupings    []ConfigGroup      `yaml:"groupings"`
-		nextRun      int64
-		latency      int64
-		running      bool
-		groupData    [][]g.SnmpPDU
-		//group_string   []string
-	} `yaml:"devices"`
+	Push     string   `yaml:"push"`
+	Interval string   `yaml:"interval"`
+	Devices  []Device `yaml:"devices"`
 }
+
+type Device struct {
+	Name         string             `yaml:"name"`
+	Host         string             `yaml:"host"`
+	Port         uint16             `yaml:"port"`
+	Protocol     string             `yaml:"protocol"`
+	Community    string             `yaml:"community"`
+	UserName     string             `yaml:"username"`
+	AuthProto    string             `yaml:"auth-protocol"`
+	AuthPassword string             `yaml:"auth-password"`
+	PrivProto    string             `yaml:"priv-protocol"`
+	PrivPassword string             `yaml:"priv-password"`
+	Version      string             `yaml:"version"`
+	Interval     string             `yaml:"interval"`
+	Enabled      bool               `yaml:"enabled" default:true`
+	CopyFrom     string             `yaml:"copy-oids-from"`
+	Labels       map[string]string  `yaml:"labels"`
+	Status       map[string]string  `yaml:"status"`
+	StaticLabels map[string]string  `yaml:"static-labels"`
+	StaticStatus map[string]float64 `yaml:"static-status"`
+	Groupings    []ConfigGroup      `yaml:"groupings"`
+	nextRun      int64
+	latency      int64
+	running      bool
+	groupData    [][]g.SnmpPDU
+	//group_string   []string
+}
+
 type ConfigGroup struct {
 	Group        string             `yaml:"group"`
 	OidIndex     string             `yaml:"index"`
@@ -81,6 +88,10 @@ type ConfigGroup struct {
 	StaticLabels map[string]string  `yaml:"static-labels"`
 	StaticStatus map[string]float64 `yaml:"static-status"`
 	Interval     string             `yaml:"interval"`
+}
+
+func (d *Device) printNameHost() string {
+	return fmt.Sprintf("%s(%s)", d.Name, d.Host)
 }
 
 var deviceMetrics []string
@@ -100,6 +111,9 @@ var maxRepetitions = uint8(50)
 var timeout = 5
 
 func main() {
+	logger = log.NewLogfmtLogger(log.StdlibWriter{})
+	logger = log.With(logger, "ts", log.DefaultTimestamp, "caller", log.DefaultCaller)
+
 	flag.Usage = func() {
 		_, file := filepath.Split(os.Args[0])
 		_, _ = fmt.Fprintf(os.Stderr, "Simple SNMP prometheus exporter (%s),\n    written by Paul Schou github@paulschou.com in December 2020,\n    extend pokornyIt (https://github.com/pokornyIt) in September 2022\n    Prsonal use only, provided AS-IS -- not responsible for loss.\nUsage implies agreement.\n\nUsage of %s:\n", version, file)
@@ -144,14 +158,23 @@ func main() {
 		}()
 	}
 
-	yamlFile, err := ioutil.ReadFile(*configFileFlag)
+	// set level
+	if debug {
+		logger = level.NewFilter(logger, level.AllowAll())
+	} else {
+		logger = level.NewFilter(logger, level.AllowInfo())
+	}
+
+	yamlFile, err := os.ReadFile(*configFileFlag)
 	if err != nil {
-		log.Fatalf("Cannot read config file %s with error: %s", *configFileFlag, err)
+		_ = level.Error(logger).Log("msg", fmt.Sprintf("cannot read config file %s with error: %s", *configFileFlag, err), "err", err)
+		os.Exit(1)
 	}
 
 	err = yaml.Unmarshal(yamlFile, &config)
 	if err != nil {
-		log.Fatal("Invalid config file format ", err)
+		_ = level.Error(logger).Log("msg", "invalid config file format ", "err", err)
+		os.Exit(2)
 	}
 	if config.Interval == "" {
 		config.Interval = "1m"
@@ -178,7 +201,8 @@ func main() {
 				config.Devices[i].Status = config.Devices[srcIterator].Status
 				config.Devices[i].Groupings = config.Devices[srcIterator].Groupings
 			} else {
-				log.Println("Warning: copy-from source device", dev.CopyFrom, "missing for", dev.Name)
+				_ = level.Warn(logger).Log("msg", fmt.Sprintf("copy-from source device %s missing for %s",
+					dev.CopyFrom, dev.Name), "device", dev.Name, "host", dev.Host)
 			}
 		}
 
@@ -213,18 +237,18 @@ func main() {
 			config.Devices[i].running = false
 		}
 
-		if debug {
-			log.Println(fmt.Sprintf("#conf %s: %+v\r\n", dev.Name, config.Devices[i]))
-		}
+		_ = level.Debug(logger).Log("msg", fmt.Sprintf("configuration for device %s", dev.Name), "device", dev.Name,
+			"host", dev.Host, "config", fmt.Sprintf("%+v", config.Devices[i]))
 
 	}
 	if passed == false {
-		log.Fatal("Failed config checks")
+		_ = level.Error(logger).Log("msg", "failed config checks")
+		os.Exit(3)
 	}
 
 	var l net.Listener
 	if *tlsEnabledFlag {
-		log.Println("Setup TLS")
+		_ = level.Debug(logger).Log("msg", "start setup parameters for TLS")
 		var config tls.Config
 		if *secureServerFlag {
 			config = tls.Config{RootCAs: rootPool,
@@ -245,70 +269,65 @@ func main() {
 				ClientCAs: rootPool, InsecureSkipVerify: *verifyServerFlag == false}
 		}
 		config.GetCertificate = func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			if debug {
-				log.Println("  Get Cert Returning keypair")
-			}
+			_ = level.Debug(logger).Log("msg", "get Cert Returning keypair")
 			return keypair, nil
 		}
 
 		config.Rand = rand.Reader
-		if debug {
-			fmt.Println("TLS Listening on", *listenPortFlag)
-		}
 		if l, err = tls.Listen("tcp", *listenPortFlag, &config); err != nil {
-			log.Fatal(err)
+			_ = level.Error(logger).Log("msg", "can't create TLS listener", "port", *listenPortFlag, "err", err)
+			os.Exit(4)
 		}
+		_ = level.Debug(logger).Log("msg", fmt.Sprintf("TLS Listening on %s", *listenPortFlag), "port", *listenPortFlag)
 	} else {
 		var err error
-		if debug {
-			fmt.Println("Listening on", *listenPortFlag)
-		}
 		if l, err = net.Listen("tcp", *listenPortFlag); err != nil {
-			log.Fatal(err)
+			_ = level.Error(logger).Log("msg", "can't create listener", "port", *listenPortFlag, "err", err)
+			os.Exit(5)
 		}
+		_ = level.Debug(logger).Log("msg", fmt.Sprintf("listening on %s", *listenPortFlag), "port", *listenPortFlag)
 	}
 
 	// Expose prometheus endpoint for querying metrics for debugging
-	http.HandleFunc("/metrics", ServeMetrics)
-	//go func() {
-	log.Println("Server start in go routine")
-	err = http.Serve(l, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	//}()
 
 	// make the query interval be unique to each device
 	// Collect metrics from snmp endpoints
 	deviceMetrics = make([]string, len(config.Devices))
 	for i, dev := range config.Devices {
 		if dev.Enabled {
+			_ = level.Debug(logger).Log("msg", fmt.Sprintf("Device is enabled with interval %s for %s", dev.Interval,
+				dev.printNameHost()), "device", dev.Name, "host", dev.Host)
 
 			interval, err := time.ParseDuration(dev.Interval)
 			if err != nil {
-				log.Fatal("Device "+dev.Name+": Query interval not a valid time", err)
+				_ = level.Error(logger).Log("msg", fmt.Sprintf("device %s = Query interval not a valid time", dev.printNameHost()),
+					"device", dev.Name, "host", dev.Host, "err", err)
+				os.Exit(6)
 			}
 			go func(i int, interval time.Duration) {
 				runInterval := interval.Nanoseconds()
 				config.Devices[i].nextRun = ((time.Now().UnixNano()+2e9)/runInterval + 1) * runInterval
 				time.Sleep(time.Duration(config.Devices[i].nextRun-time.Now().UnixNano()-1.2e9) * time.Nanosecond)
-				if debug {
-					log.Println(" Next run for device "+config.Devices[i].Name+":", time.Unix(config.Devices[i].nextRun/1e9, 0))
-				}
+				_ = level.Debug(logger).Log("msg", fmt.Sprintf("next run for device %s is %s", config.Devices[i].printNameHost(),
+					time.Unix(config.Devices[i].nextRun/1e9, 0).String()), "device", config.Devices[i].Name, "host", config.Devices[i].Host,
+					"next", time.Unix(config.Devices[i].nextRun/1e9, 0).String())
 				go collectDev(i)
 				for range time.Tick(interval) {
 					config.Devices[i].nextRun = ((time.Now().UnixNano()+2e9)/runInterval + 1) * runInterval
-					if debug {
-						log.Println(" Next run for device "+config.Devices[i].Name+":", time.Unix(config.Devices[i].nextRun/1e9, 0))
-					}
+					_ = level.Debug(logger).Log("msg", fmt.Sprintf("next run for device %s is %s", config.Devices[i].printNameHost(),
+						time.Unix(config.Devices[i].nextRun/1e9, 0).String()), "device", config.Devices[i].Name, "host", config.Devices[i].Host,
+						"next", time.Unix(config.Devices[i].nextRun/1e9, 0).String())
 					go collectDev(i)
 				}
 			}(i, interval)
+		} else {
+			_ = level.Info(logger).Log("msg", fmt.Sprintf("device not enabled %s", dev.printNameHost()), "device", dev.Name, "host", dev.Host)
 		}
 	}
 
 	// Push metrics if a push endpoint has been defined
 	if config.Push != "" {
+		_ = level.Debug(logger).Log("msg", "push function enabled")
 		ticker := time.NewTicker(minInterval)
 		for {
 			select {
@@ -324,6 +343,7 @@ func main() {
 						return
 					}
 					parts := strings.Split(config.Push, " ")
+					localLogger := log.With(logger, "instance", time.Now().UnixMilli())
 					for _, url := range parts {
 						tlsClient := false
 						if strings.HasPrefix(url, "https://") {
@@ -358,10 +378,12 @@ func main() {
 						}
 						client := &http.Client{Transport: tr}
 
-						log.Println("Posting metrics to", url, len(s))
+						_ = level.Info(localLogger).Log("msg", fmt.Sprintf("posting metrics to %s - %d", url, len(s)), "url", url)
+						_ = level.Debug(localLogger).Log("msg", "posting data", "data", s)
 
 						response, err := client.Post(url, "text/plain", bytes.NewBuffer([]byte(s)))
 						if err != nil {
+							_ = level.Error(localLogger).Log("msg", "problem post data to url")
 							fmt.Println(err)
 							continue
 						}
@@ -369,12 +391,12 @@ func main() {
 							_ = Body.Close()
 						}(response.Body)
 
-						content, _ := ioutil.ReadAll(response.Body)
+						content, _ := io.ReadAll(response.Body)
 						s := strings.TrimSpace(string(content))
 
 						// If there is any reply, return it
 						if len(s) > 0 {
-							fmt.Println(s)
+							_ = level.Info(localLogger).Log("msg", "response data", "data", s)
 						}
 
 					}
@@ -383,9 +405,18 @@ func main() {
 		}
 	}
 	// End of Main function
+
+	http.HandleFunc("/metrics", ServeMetrics)
+	_ = level.Info(logger).Log("msg", fmt.Sprintf("server start on %s", *listenPortFlag), "port", *listenPortFlag)
+	err = http.Serve(l, nil)
+	if err != nil {
+		_ = level.Error(logger).Log("msg", "can't start server", "err", err)
+		os.Exit(7)
+	}
 }
 
-func getSNMP(i int) *g.GoSNMP {
+func getSNMP(i int) (*g.GoSNMP, error) {
+	lcLogger := log.With(logger, "device", config.Devices[i].Name, "host", config.Devices[i].Host)
 	params := &g.GoSNMP{
 		Port:               161,
 		Transport:          "udp",
@@ -400,7 +431,8 @@ func getSNMP(i int) *g.GoSNMP {
 		Context:            context.TODO(),
 	}
 	if debug {
-		params.Logger = g.NewLogger(log.New(os.Stdout, "", 0))
+		log.MessageKey("msg")
+		params.Logger = g.NewLogger(stdlog.New(log.NewStdlibAdapter(lcLogger), "", 0))
 	}
 	switch ver := config.Devices[i].Version; ver {
 	case "1":
@@ -478,9 +510,10 @@ func getSNMP(i int) *g.GoSNMP {
 
 	err := params.Connect()
 	if err != nil {
-		log.Fatalf("Connect failed on device "+config.Devices[i].Name+", err: %v", err)
+		_ = level.Error(lcLogger).Log("msg", fmt.Sprintf("connect failed on device %s", config.Devices[i].printNameHost()), "err", err)
+		return nil, err
 	}
-	return params
+	return params, nil
 }
 
 func loadKeys() {
@@ -490,17 +523,17 @@ func loadKeys() {
 	tmpKey, errTmpKey := tls.LoadX509KeyPair(certFile, keyFile)
 	if errTmpKey != nil {
 		if keypair == nil {
-			log.Fatalf("failed to loadkey pair: %s %s %s", certFile, keyFile, errTmpKey)
+			_ = level.Error(logger).Log("msg", fmt.Sprintf("failed to loadkey pair: %s %s", certFile, keyFile), "err", errTmpKey)
+			panic(8)
 		}
 		keypairCount++
-		log.Println("WARNING: Cannot load keypair (cert/key)", certFile, keyFile, "attempt:", keypairCount)
+		_ = level.Warn(logger).Log("msg", fmt.Sprintf("cannot load keypair (cert/key) % % attempt: %s", certFile, keyFile, keypairCount))
 		if keypairCount > 10 {
-			log.Fatalf("failed to refresh pair: %s %s %s", certFile, keyFile, errTmpKey)
+			_ = level.Error(logger).Log("msg", fmt.Sprintf("failed to refresh pair: %s %s", certFile, keyFile), "err", errTmpKey)
+			panic(9)
 		}
 	} else {
-		if debug {
-			log.Println("Loaded keypair", certFile, keyFile)
-		}
+		_ = level.Debug(logger).Log("msg", fmt.Sprintf("loaded keypar %s %s", certFile, keyFile))
 		keypair = &tmpKey
 		keypairCount = 0
 	}
@@ -508,17 +541,16 @@ func loadKeys() {
 	errRead := LoadCertificateFromFile(rootFile)
 	if errRead != nil {
 		if rootPool == nil {
-			log.Fatalf("failed to load CA: %s %s", rootFile, errRead)
+			_ = level.Error(logger).Log("msg", fmt.Sprintf("failed to load CA: %s", rootFile), "err", errRead)
+			panic(10)
 		}
 		rootCount++
-		log.Println("WARNING: Cannot load CA file", rootFile, "attempt:", rootCount)
+		_ = level.Warn(logger).Log("msg", fmt.Sprintf("cannot load CA file %s attempt: %d", rootFile, rootCount))
 		if rootCount > 10 {
-			log.Fatalf("failed refresh CA: %s %s", rootFile, errRead)
+			_ = level.Error(logger).Log("msg", fmt.Sprintf("failed refresh CA: %s", rootFile), "err", errRead)
 		}
 	} else {
-		if debug {
-			log.Println("Loaded CA", rootFile)
-		}
+		_ = level.Debug(logger).Log("msg", fmt.Sprintf("loaded CA %s", rootFile))
 		rootCount = 0
 	}
 }
@@ -556,7 +588,9 @@ func LoadCertificateFromFile(path string) error {
 }
 
 func ServeMetrics(w http.ResponseWriter, r *http.Request) {
-	log.Println("One request on /metric")
+	locLogger := log.With(logger, "request", r.Host)
+	_ = level.Debug(locLogger).Log("msg", "request on /metrics")
+
 	w.Header().Set("Server", "SNMP-Prom Exporter - Written by PaulSchou.com; CopyRight 2020 see license file for more details")
 	w.Header().Add("Cache-Control:", "no-store, no-cache")
 	w.Header().Add("X-Content-Type-Options", "nosniff")
@@ -598,16 +632,31 @@ func mkList(oids []string, devOids map[string]string) []string {
 
 func collectDev(idev int) {
 	if config.Devices[idev].running {
+		_ = level.Debug(logger).Log("msg", fmt.Sprintf("not repeat read data from device %s it current read", config.Devices[idev].printNameHost()),
+			"device", config.Devices[idev].Name, "host", config.Devices[idev].Host)
+		return
+	}
+	if !config.Devices[idev].Enabled {
+		_ = level.Warn(logger).Log("msg", fmt.Sprintf("device disabled due connection error %s", config.Devices[idev].printNameHost()),
+			"device", config.Devices[idev].Name, "host", config.Devices[idev].Host)
 		return
 	}
 	config.Devices[idev].running = true
 	defer func() { config.Devices[idev].running = false }()
 
 	queryChannel := make(chan []g.SnmpPDU) // preallocate channels for parallelism
+	_ = level.Debug(logger).Log("msg", fmt.Sprintf("strat collect data for device %s", config.Devices[idev].printNameHost()),
+		"device", config.Devices[idev].Name, "host", config.Devices[idev].Host)
 
 	for i, group := range config.Devices[idev].Groupings {
 		if group.Priority {
-			snmp := getSNMP(idev)
+			snmp, err := getSNMP(idev)
+			if err != nil {
+				_ = level.Warn(logger).Log("msg", fmt.Sprintf("device disabling due connection error %s", config.Devices[idev].printNameHost()),
+					"device", config.Devices[idev].Name, "host", config.Devices[idev].Host, "err", err)
+				config.Devices[idev].Enabled = false
+				return
+			}
 			defer snmp.Conn.Close()
 			if debug {
 				fmt.Println("#", config.Devices[idev].Name, "setting up query for", group.Group)
@@ -647,7 +696,9 @@ func collectDev(idev int) {
 				}
 
 				if len(data) == 0 {
-					log.Println(Cyan+"Empty reply during oid fetch for priority group:", config.Devices[idev].Groupings[i].Group, " name:", config.Devices[idev].Name, "host:", config.Devices[idev].Host, err, Reset)
+					_ = level.Warn(logger).Log("msg", fmt.Sprintf("empty reply during oid fetch for priority group %s on device %s",
+						config.Devices[idev].Groupings[i].Group, config.Devices[idev].printNameHost()), "err", err, "device", config.Devices[idev].Name,
+						"host", config.Devices[idev].Host)
 				}
 
 				queryChannel <- data
@@ -663,7 +714,11 @@ func collectDev(idev int) {
 		}
 	}
 
-	snmp := getSNMP(idev)
+	snmp, err := getSNMP(idev)
+	if err != nil {
+		config.Devices[idev].Enabled = false
+		return
+	}
 	defer snmp.Conn.Close()
 	snmp.Retries = 3
 
@@ -690,14 +745,18 @@ func collectDev(idev int) {
 	snmp.OnSent = nil
 	snmp.OnRecv = nil
 	if err != nil {
-		log.Println("Error during oid fetch for device status host:", config.Devices[idev].Host, err)
+		_ = level.Error(logger).Log("msg", fmt.Sprintf("error during oid fetch for device status %s",
+			config.Devices[idev].printNameHost()), "device", config.Devices[idev].Name,
+			"host", config.Devices[idev].Host, "err", err)
 		return
 	}
 	//dev_query <- result
 	//}()
 	//deviceData := <-dev_query
 	if deviceData == nil {
-		log.Println("No data returned for dev query, skipping host", config.Devices[idev].Host, err)
+		_ = level.Error(logger).Log("msg", fmt.Sprintf("no data returned for dev query, skipping device %s",
+			config.Devices[idev].printNameHost()), "device", config.Devices[idev].Name,
+			"host", config.Devices[idev].Host, "err", err)
 		return
 	}
 
@@ -734,16 +793,16 @@ func collectDev(idev int) {
 	for i, group := range config.Devices[idev].Groupings {
 		//time.Sleep(80 * time.Millisecond)
 		if !group.Priority {
-			if debug {
-				fmt.Println("#", config.Devices[idev].Name, "setting up query for", group.Group)
-			}
-
+			_ = level.Debug(logger).Log("msg", fmt.Sprintf("%s setting up query for %s", config.Devices[idev].printNameHost(), group.Group),
+				"device", config.Devices[idev].Name, "host", config.Devices[idev].Host)
 			if debug {
 				fmt.Println("#", config.Devices[idev].Name, "sending query for", config.Devices[idev].Groupings[i].Group, oids)
 			}
+			_ = level.Debug(logger).Log("msg", fmt.Sprintf("%s sending query for %s %s", config.Devices[idev].printNameHost(),
+				config.Devices[idev].Groupings[i].Group, oids), "device", config.Devices[idev].Name, "host", config.Devices[idev].Host)
 
 			data := make([]g.SnmpPDU, 0)
-			var err error
+			//var err error
 			for _, oid := range config.Devices[idev].Groupings[i].Status {
 				result, err := snmp.WalkAll(oid)
 				if err == nil {
@@ -763,7 +822,8 @@ func collectDev(idev int) {
 			}
 
 			if len(data) == 0 {
-				log.Println(Cyan+"Empty reply during oid fetch for group:", config.Devices[idev].Groupings[i].Group, " name:", config.Devices[idev].Name, "host:", config.Devices[idev].Host, err, Reset)
+				_ = level.Warn(logger).Log("msg", fmt.Sprintf("Empty reply during oid fetch for group %s %s",
+					config.Devices[idev].Groupings[i].Group, config.Devices[idev].printNameHost()), "device", config.Devices[idev].Name, "host", config.Devices[idev].Host)
 			}
 
 			config.Devices[idev].groupData[i] = data
@@ -787,6 +847,7 @@ func dotEnd(str string) (string, string) {
 		return strings.TrimSuffix(temp[0], ".") + ".", temp[1]
 	}
 }
+
 func printPDU(pdu g.SnmpPDU, oid_type string) string {
 	switch pdu.Type {
 	case g.OctetString:
@@ -804,9 +865,8 @@ func printPDU(pdu g.SnmpPDU, oid_type string) string {
 
 func parse(devLabels map[string]string, group ConfigGroup, data []g.SnmpPDU, runTime int64, outData *bytes.Buffer) {
 	if len(data) == 0 {
-		if debug {
-			log.Println(Yellow+"Empty SNMP reply on", devLabels["device_name"], "- Cannot parse data for group", group.Group, Reset)
-		}
+		_ = level.Debug(logger).Log("msg", fmt.Sprintf("empty SNMP reply on %s, can't parse data for group %s",
+			devLabels["device_name"], group.Group))
 		return
 	}
 	// PARSE Labels for Group
