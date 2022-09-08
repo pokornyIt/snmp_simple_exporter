@@ -31,20 +31,6 @@ import (
 	"time"
 )
 
-var (
-	version = "0.1.1"
-	Reset   = "\033[0m"
-	Red     = "\033[31m"
-	Green   = "\033[32m"
-	Yellow  = "\033[33m"
-	Blue    = "\033[34m"
-	Purple  = "\033[35m"
-	Cyan    = "\033[36m"
-	Gray    = "\033[37m"
-	White   = "\033[97m"
-	logger  log.Logger // logger
-)
-
 type Config struct {
 	Push     string   `yaml:"push"`
 	Interval string   `yaml:"interval"`
@@ -94,6 +80,9 @@ func (d *Device) printNameHost() string {
 	return fmt.Sprintf("%s(%s)", d.Name, d.Host)
 }
 
+var (
+	logger log.Logger // logger
+)
 var deviceMetrics []string
 var config Config
 
@@ -110,13 +99,22 @@ var debug = false
 var maxRepetitions = uint8(50)
 var timeout = 5
 
+var (
+	Version   string // for build data
+	Revision  string // for build data
+	Branch    string // for build data
+	BuildUser string // for build data
+	BuildDate string // for build data
+)
+
 func main() {
 	logger = log.NewLogfmtLogger(log.StdlibWriter{})
 	logger = log.With(logger, "ts", log.DefaultTimestamp, "caller", log.DefaultCaller)
 
 	flag.Usage = func() {
 		_, file := filepath.Split(os.Args[0])
-		_, _ = fmt.Fprintf(os.Stderr, "Simple SNMP prometheus exporter (%s),\n    written by Paul Schou github@paulschou.com in December 2020,\n    extend pokornyIt (https://github.com/pokornyIt) in September 2022\n    Prsonal use only, provided AS-IS -- not responsible for loss.\nUsage implies agreement.\n\nUsage of %s:\n", version, file)
+		_, _ = fmt.Fprintf(os.Stderr, "Simple SNMP prometheus exporter (%s),\n    written by Paul Schou github@paulschou.com in December 2020,\n    extend pokornyIt (https://github.com/pokornyIt) in September 2022\n    Prsonal use only, provided AS-IS -- not responsible for loss.\nUsage implies agreement.\n\nUsage of %s:\n", Version, file)
+		_, _ = fmt.Fprintf(os.Stderr, "   Revision %s, Branch %s, Build user %s, Build date %s\r\n", Revision, Branch, BuildUser, BuildDate)
 		flag.PrintDefaults()
 	}
 
