@@ -18,7 +18,6 @@ import (
 	g "github.com/gosnmp/gosnmp"
 	"gopkg.in/yaml.v2"
 	"io"
-	"io/ioutil"
 	stdlog "log"
 	"net"
 	"net/http"
@@ -50,7 +49,7 @@ type Device struct {
 	PrivPassword string             `yaml:"priv-password"`
 	Version      string             `yaml:"version"`
 	Interval     string             `yaml:"interval"`
-	Enabled      bool               `yaml:"enabled" default:true`
+	Enabled      bool               `yaml:"enabled" default:"true"`
 	CopyFrom     string             `yaml:"copy-oids-from"`
 	Labels       map[string]string  `yaml:"labels"`
 	Status       map[string]string  `yaml:"status"`
@@ -525,7 +524,7 @@ func loadKeys() {
 			panic(8)
 		}
 		keypairCount++
-		_ = level.Warn(logger).Log("msg", fmt.Sprintf("cannot load keypair (cert/key) % % attempt: %s", certFile, keyFile, keypairCount))
+		_ = level.Warn(logger).Log("msg", fmt.Sprintf("cannot load keypair (cert/key) %s %s attempt: %d", certFile, keyFile, keypairCount))
 		if keypairCount > 10 {
 			_ = level.Error(logger).Log("msg", fmt.Sprintf("failed to refresh pair: %s %s", certFile, keyFile), "err", errTmpKey)
 			panic(9)
@@ -554,7 +553,7 @@ func loadKeys() {
 }
 
 func LoadCertificateFromFile(path string) error {
-	raw, err := ioutil.ReadFile(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
@@ -655,7 +654,9 @@ func collectDev(idev int) {
 				config.Devices[idev].Enabled = false
 				return
 			}
-			defer snmp.Conn.Close()
+			defer func(Conn net.Conn) {
+				_ = Conn.Close()
+			}(snmp.Conn)
 			if debug {
 				fmt.Println("#", config.Devices[idev].Name, "setting up query for", group.Group)
 			}
@@ -703,7 +704,7 @@ func collectDev(idev int) {
 			}(idev, i)
 		}
 	}
-	for i, _ := range config.Devices[idev].Groupings {
+	for i := range config.Devices[idev].Groupings {
 		if config.Devices[idev].Groupings[i].Priority {
 			config.Devices[idev].groupData[i] = <-queryChannel
 			if len(config.Devices[idev].groupData[i]) == 0 {
@@ -717,7 +718,9 @@ func collectDev(idev int) {
 		config.Devices[idev].Enabled = false
 		return
 	}
-	defer snmp.Conn.Close()
+	defer func(Conn net.Conn) {
+		_ = Conn.Close()
+	}(snmp.Conn)
 	snmp.Retries = 3
 
 	// Setup output details / target
@@ -888,7 +891,7 @@ func parse(devLabels map[string]string, group ConfigGroup, data []g.SnmpPDU, run
 	}
 
 	// PARSE Stats for Group
-	for t, _ := range groupLabels {
+	for t := range groupLabels {
 		for lbl, value := range group.StaticStatus {
 			outData.WriteString(fmt.Sprintf("snmp_%s_%s{%s} %v %d\n", group.Group, lbl, promLabels(devLabels, commonLabels, groupLabels[t]), value, runTime))
 		}
@@ -912,7 +915,7 @@ func parse(devLabels map[string]string, group ConfigGroup, data []g.SnmpPDU, run
 
 func checkLabels(labels map[string]string) bool {
 	check := true
-	for lbl, _ := range labels {
+	for lbl := range labels {
 		if checkLabel(lbl) == false {
 			fmt.Println("  invalid label:", lbl)
 			check = false
@@ -985,7 +988,7 @@ func oidIndex(lbl map[string]string, oid string, outFmt string) {
 			lbl["oid_IPv"] = strings.Join(sp[8:9], ".")
 			lbl["oid_nextHop"] = strings.Join(sp[9:13], ".")
 			if len(sp) > 13 {
-				lbl["oid_index"] = strings.Join(sp[13:len(sp)], ".")
+				lbl["oid_index"] = strings.Join(sp[13:], ".")
 			}
 		} else {
 			lbl["oid_index"] = "!route4 " + oid
@@ -997,7 +1000,7 @@ func oidIndex(lbl map[string]string, oid string, outFmt string) {
 			lbl["oid_IPv"] = strings.Join(sp[8:9], ".")
 			lbl["oid_nextHop"] = strings.Join(sp[10:14], ".")
 			if len(sp) > 14 {
-				lbl["oid_index"] = strings.Join(sp[13:len(sp)], ".")
+				lbl["oid_index"] = strings.Join(sp[13:], ".")
 			}
 		} else {
 			lbl["oid_index"] = "!route14 " + oid
@@ -1006,7 +1009,7 @@ func oidIndex(lbl map[string]string, oid string, outFmt string) {
 		if len(sp) >= 17 {
 			lbl["oid_addr"] = byteStr(b[0:16], "ipv6")
 			if len(sp) > 16 {
-				lbl["oid_index"] = strings.Join(sp[16:len(sp)], ".")
+				lbl["oid_index"] = strings.Join(sp[16:], ".")
 			}
 		} else {
 			lbl["oid_index"] = "!route6 " + oid
@@ -1024,7 +1027,7 @@ func oidIndex(lbl map[string]string, oid string, outFmt string) {
 
 func checkLabelN(labels map[string]float64) bool {
 	check := true
-	for lbl, _ := range labels {
+	for lbl := range labels {
 		if checkLabel(lbl) == false {
 			fmt.Println("  invalid label:", lbl, "/ allowed characters: [a-zA-Z0-9_]")
 			check = false
