@@ -108,7 +108,7 @@ var (
 
 func main() {
 	logger = log.NewLogfmtLogger(log.StdlibWriter{})
-	logger = log.With(logger, "ts", log.DefaultTimestamp, "caller", log.DefaultCaller)
+	logger = log.With(logger, "ts", log.DefaultTimestamp, "caller", log.Caller(5))
 
 	flag.Usage = func() {
 		_, file := filepath.Split(os.Args[0])
